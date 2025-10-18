@@ -24,7 +24,7 @@ jobs:
         env:
           VITE_API_URL: https://valora-backend-u988.onrender.com
         run: |
-          cd valora/frontend
+          cd frontend
           npm install
           npm run build
       - uses: actions/configure-pages@v5   
