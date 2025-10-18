@@ -4,4 +4,14 @@
 
 body {
   font-family: 'Inter', sans-serif;
+  /* Dark aurora theme background */
+  background-color: #070b1e;
+  background-image:
+    linear-gradient(135deg, rgba(16, 101, 122, 0.4), rgba(44, 9, 88, 0.4)),
+    url('aurora-hero.svg');
+  background-size: cover;
+  background-position: center;
+  background-repeat: no-repeat;
+  min-height: 100vh;
+  color: #e5e7eb; /* text-gray-200 */
 }

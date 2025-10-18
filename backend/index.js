@@ -1,5 +1,6 @@
 import express from 'express';
 import fetch from 'node-fetch';
+import yahooFinance from 'yahoo-finance2';
 import LRU from 'lru-cache';
 import cors from 'cors';
 import dotenv from 'dotenv';
@@ -60,42 +61,71 @@ app.get('/api/quote', async (req, res) => {
   if (!symbol) {
     return res.status(400).json({ error: 'Missing symbol query parameter' });
   }
-  const yahooUrl = `https://query1.finance.yahoo.com/v7/finance/quote?symbols=${encodeURIComponent(symbol)}`;
-  // check cache first
-  if (cache.has(yahooUrl)) {
-    const cached = cache.get(yahooUrl);
-    return res.json(cached);
+  const cacheKey = `quote:${symbol.toUpperCase()}`;
+  // return cached response if available
+  if (cache.has(cacheKey)) {
+    return res.json(cache.get(cacheKey));
   }
   try {
-    const resp = await fetch(yahooUrl);
-    if (!resp.ok) {
-      return res.status(resp.status).json({ error: `Yahoo Finance responded with status ${resp.status}` });
-    }
-    const json = await resp.json();
-    const result = json.quoteResponse && json.quoteResponse.result && json.quoteResponse.result[0];
-    if (!result) {
+    // use yahoo-finance2 library to fetch quote; this library handles crumb and query parameters internally
+    const quote = await yahooFinance.quote(symbol.toUpperCase());
+    if (!quote) {
       return res.status(404).json({ error: 'Ticker not found' });
     }
-    const price = result.regularMarketPrice;
-    const pe = result.trailingPE;
-    const forwardPE = result.forwardPE;
-    // simple score: invert P/E values to create higher scores for lower P/E, clamp between 0 and 100
+    const price = quote.regularMarketPrice;
+    const pe = quote.trailingPE;
+    const forwardPE = quote.forwardPE;
+    // basic scoring: invert P/E values; if undefined, default to 0
     let score = 50;
     if (typeof pe === 'number' && typeof forwardPE === 'number') {
-      // avoid division by zero; cap extremes
       const invPE = 1 / Math.max(pe, 0.0001);
       const invForwardPE = 1 / Math.max(forwardPE, 0.0001);
-      // normalize to [0, 1] roughly by scaling
-      const composite = invPE + invForwardPE;
-      score = Math.min(100, Math.max(0, composite * 10));
+      score = Math.min(100, Math.max(0, (invPE + invForwardPE) * 10));
     }
-    const responseData = { symbol: result.symbol, price, pe, forwardPE, score };
-    // cache the response
-    cache.set(yahooUrl, responseData);
+    const responseData = {
+      symbol: quote.symbol,
+      price,
+      pe,
+      forwardPE,
+      score
+    };
+    cache.set(cacheKey, responseData);
     return res.json(responseData);
   } catch (error) {
-    console.error(error);
-    return res.status(500).json({ error: 'Failed to fetch quote' });
+    console.error('Error fetching quote', error);
+    // if library fails due to network or API changes, fallback to old fetch logic
+    const yahooUrl = `https://query1.finance.yahoo.com/v7/finance/quote?symbols=${encodeURIComponent(symbol)}`;
+    try {
+      const resp = await fetch(yahooUrl, {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0 Safari/537.36',
+          'Accept': 'application/json, text/plain, */*'
+        }
+      });
+      if (!resp.ok) {
+        return res.status(resp.status).json({ error: `Yahoo Finance responded with status ${resp.status}` });
+      }
+      const json = await resp.json();
+      const result = json.quoteResponse && json.quoteResponse.result && json.quoteResponse.result[0];
+      if (!result) {
+        return res.status(404).json({ error: 'Ticker not found' });
+      }
+      const price = result.regularMarketPrice;
+      const pe = result.trailingPE;
+      const forwardPE = result.forwardPE;
+      let score = 50;
+      if (typeof pe === 'number' && typeof forwardPE === 'number') {
+        const invPE = 1 / Math.max(pe, 0.0001);
+        const invForwardPE = 1 / Math.max(forwardPE, 0.0001);
+        score = Math.min(100, Math.max(0, (invPE + invForwardPE) * 10));
+      }
+      const responseData = { symbol: result.symbol, price, pe, forwardPE, score };
+      cache.set(cacheKey, responseData);
+      return res.json(responseData);
+    } catch (fallbackErr) {
+      console.error('Fallback quote fetch failed', fallbackErr);
+      return res.status(500).json({ error: 'Failed to fetch quote' });
+    }
   }
 });
 
