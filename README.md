@@ -40,6 +40,12 @@ The frontend expects a proxy at `/api/proxy?url=…` to fetch data from third 
 
 ## Deployment
 
+
+**Current deployments**:
+
+- **Frontend** (GitHub Pages): The latest build will be available at `https://willwsmith.github.io/valora/` (it may take a few minutes after each commit to appear).
+- **Backend** (Render): The API proxy is running at `https://valora-backend-u988.onrender.com` with a `/api/health` endpoint for health checks.
+
 GitHub Actions automatically build and deploy the frontend to GitHub Pages on every push to `main`.  The Pages URL will be of the form `https://<username>.github.io/valora`.  To deploy the backend, create a free web service on [Render](https://render.com/) and point it to the `backend/` directory.  See `docs/datasources.md` for information on rate limits and caching strategy.
 
 ## License
