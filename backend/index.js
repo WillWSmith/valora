@@ -49,6 +49,56 @@ app.get('/api/proxy', async (req, res) => {
   }
 });
 
+/**
+ * Quote endpoint.
+ * Fetches basic quote data for a given ticker symbol from Yahoo Finance and computes a rudimentary Smart Score.
+ * The score is currently a simple composite based on P/E and forward P/E; lower values result in higher scores.
+ * In the future this logic should be replaced by the more comprehensive scoring algorithm described in docs/research.md.
+ */
+app.get('/api/quote', async (req, res) => {
+  const symbol = req.query.symbol;
+  if (!symbol) {
+    return res.status(400).json({ error: 'Missing symbol query parameter' });
+  }
+  const yahooUrl = `https://query1.finance.yahoo.com/v7/finance/quote?symbols=${encodeURIComponent(symbol)}`;
+  // check cache first
+  if (cache.has(yahooUrl)) {
+    const cached = cache.get(yahooUrl);
+    return res.json(cached);
+  }
+  try {
+    const resp = await fetch(yahooUrl);
+    if (!resp.ok) {
+      return res.status(resp.status).json({ error: `Yahoo Finance responded with status ${resp.status}` });
+    }
+    const json = await resp.json();
+    const result = json.quoteResponse && json.quoteResponse.result && json.quoteResponse.result[0];
+    if (!result) {
+      return res.status(404).json({ error: 'Ticker not found' });
+    }
+    const price = result.regularMarketPrice;
+    const pe = result.trailingPE;
+    const forwardPE = result.forwardPE;
+    // simple score: invert P/E values to create higher scores for lower P/E, clamp between 0 and 100
+    let score = 50;
+    if (typeof pe === 'number' && typeof forwardPE === 'number') {
+      // avoid division by zero; cap extremes
+      const invPE = 1 / Math.max(pe, 0.0001);
+      const invForwardPE = 1 / Math.max(forwardPE, 0.0001);
+      // normalize to [0, 1] roughly by scaling
+      const composite = invPE + invForwardPE;
+      score = Math.min(100, Math.max(0, composite * 10));
+    }
+    const responseData = { symbol: result.symbol, price, pe, forwardPE, score };
+    // cache the response
+    cache.set(yahooUrl, responseData);
+    return res.json(responseData);
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ error: 'Failed to fetch quote' });
+  }
+});
+
 // healthcheck endpoint
 app.get('/api/health', (req, res) => {
   res.json({ status: 'ok' });
