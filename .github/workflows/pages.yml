@@ -1,5 +1,4 @@
 name: Deploy GitHub Pages
-
 on:
   push:
     branches: [main]
@@ -21,13 +20,12 @@ jobs:
       - uses: actions/setup-node@v3
         with:
           node-version: 18
-      - name: Install dependencies
-        working-directory: frontend
-        run: npm install
-      - name: Build
-        working-directory: frontend
-        run: npm run build
-      - name: Upload artifact
+      - name: Install & Build frontend
+        run: |
+          cd frontend
+          npm install
+          npm run build
+      - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
         with:
           path: frontend/dist
@@ -38,6 +36,6 @@ jobs:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
-      - name: Deploy
+      - name: Deploy to GitHub Pages
         id: deployment
         uses: actions/deploy-pages@v4
