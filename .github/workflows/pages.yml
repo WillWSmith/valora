@@ -21,8 +21,10 @@ jobs:
         with:
           node-version: 18
       - name: Install & Build frontend
+        env:
+          VITE_API_URL: https://valora-backend-u988.onrender.com
         run: |
-          cd frontend
+          cd valora/frontend
           npm install
           npm run build
       - uses: actions/configure-pages@v5   

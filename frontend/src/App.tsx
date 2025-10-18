@@ -1,5 +1,10 @@
 import React, { useState } from 'react';
 
+// Base URL for backend API. When deploying, define VITE_API_URL in your build environment
+// so that API calls go to your Render backend. During local dev, this defaults to an empty string,
+// which proxies to the same origin when using `vite dev`.
+const API_BASE: string = (import.meta as any).env?.VITE_API_URL || '';
+
 export default function App() {
   // state to hold user input and fetched data
   const [query, setQuery] = useState('');
@@ -13,7 +18,7 @@ export default function App() {
     setError(null);
     setData(null);
     try {
-      const resp = await fetch(`/api/quote?symbol=${encodeURIComponent(query.trim())}`);
+      const resp = await fetch(`${API_BASE}/api/quote?symbol=${encodeURIComponent(query.trim())}`);
       if (!resp.ok) {
         const msg = await resp.json();
         throw new Error(msg.error || 'Request failed');
@@ -36,7 +41,7 @@ export default function App() {
   return (
     <div className="min-h-screen flex flex-col items-center justify-start p-8 gap-6">
       <header className="w-full max-w-4xl text-center">
-        <img src="/valora-logo.svg" alt="Valora logo" className="mx-auto w-16 h-16 mb-4" />
+        <img src="valora-logo.svg" alt="Valora logo" className="mx-auto w-16 h-16 mb-4" />
         <h1 className="text-4xl font-bold mb-2">Valora</h1>
         <p className="text-gray-500 dark:text-gray-400">Transparent Smart Score for your favorite stocks</p>
       </header>
