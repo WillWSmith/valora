@@ -95,33 +95,40 @@ async function refreshYahooSession() {
   const crumbUrl = 'https://query1.finance.yahoo.com/v1/test/getcrumb';
 
   console.log('[YahooSession] Refreshing Yahoo Finance session');
-  const firstAttempt = await fetch(crumbUrl, { headers: YAHOO_REQUEST_HEADERS });
-  console.log(
-    `[YahooSession] Initial crumb response: ${firstAttempt.status} ${firstAttempt.statusText}`
-  );
-  let cookies = extractCookies(firstAttempt.headers);
-  let crumbText = firstAttempt.ok ? (await firstAttempt.text()).trim() : '';
+  let crumbText = '';
+  let cookies = [];
 
-  if (!crumbText) {
-    const cookieHeader = buildCookieHeader(cookies);
-    const retryHeaders = cookieHeader
-      ? { ...YAHOO_REQUEST_HEADERS, Cookie: cookieHeader }
-      : YAHOO_REQUEST_HEADERS;
-    const retry = await fetch(crumbUrl, { headers: retryHeaders });
-    console.log(`[YahooSession] Retry crumb response: ${retry.status} ${retry.statusText}`);
-    const retryCookies = extractCookies(retry.headers);
-    if (retryCookies.length) {
-      cookies = retryCookies;
-    }
-    if (retry.ok) {
-      crumbText = (await retry.text()).trim();
-    }
+  try {
+    const firstAttempt = await fetch(crumbUrl, { headers: YAHOO_REQUEST_HEADERS });
+    console.log(
+      `[YahooSession] Initial crumb response: ${firstAttempt.status} ${firstAttempt.statusText}`
+    );
+    cookies = extractCookies(firstAttempt.headers);
+    crumbText = firstAttempt.ok ? (await firstAttempt.text()).trim() : '';
+
     if (!crumbText) {
-      throw new Error(`Failed to retrieve Yahoo Finance crumb (status: ${retry.status})`);
+      const cookieHeader = buildCookieHeader(cookies);
+      const retryHeaders = cookieHeader
+        ? { ...YAHOO_REQUEST_HEADERS, Cookie: cookieHeader }
+        : YAHOO_REQUEST_HEADERS;
+      const retry = await fetch(crumbUrl, { headers: retryHeaders });
+      console.log(`[YahooSession] Retry crumb response: ${retry.status} ${retry.statusText}`);
+      const retryCookies = extractCookies(retry.headers);
+      if (retryCookies.length) {
+        cookies = retryCookies;
+      }
+      if (retry.ok) {
+        crumbText = (await retry.text()).trim();
+      }
+      if (!crumbText) {
+        console.warn('[YahooSession] Crumb endpoint responded without a crumb value');
+      }
     }
+  } catch (err) {
+    console.warn('[YahooSession] Failed to refresh crumb, continuing without it', err);
   }
 
-  yahooSession.crumb = crumbText;
+  yahooSession.crumb = crumbText || null;
   yahooSession.cookie = buildCookieHeader(cookies);
   yahooSession.expiresAt = Date.now() + 1000 * 60 * 30; // 30 minutes
   console.log('[YahooSession] Session refreshed', {
