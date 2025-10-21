@@ -65,8 +65,27 @@ const yahooSession = {
 };
 
 function extractCookies(headers) {
-  const raw = headers.raw()?.['set-cookie'] || [];
-  return raw.map((cookie) => cookie.split(';')[0]).filter(Boolean);
+  if (!headers) {
+    return [];
+  }
+  if (typeof headers.getSetCookie === 'function') {
+    return headers
+      .getSetCookie()
+      .map((cookie) => cookie.split(';')[0])
+      .filter(Boolean);
+  }
+  if (typeof headers.raw === 'function') {
+    const raw = headers.raw()?.['set-cookie'] || [];
+    return raw.map((cookie) => cookie.split(';')[0]).filter(Boolean);
+  }
+  const header = headers.get?.('set-cookie');
+  if (header) {
+    return header
+      .split(/,(?=[^,]+=)/)
+      .map((cookie) => cookie.split(';')[0])
+      .filter(Boolean);
+  }
+  return [];
 }
 
 function buildCookieHeader(cookies) {
