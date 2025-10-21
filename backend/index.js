@@ -94,12 +94,14 @@ app.get('/api/quote', async (req, res) => {
   } catch (error) {
     console.error('Error fetching quote', error);
     // if library fails due to network or API changes, fallback to old fetch logic
-    const yahooUrl = `https://query1.finance.yahoo.com/v7/finance/quote?symbols=${encodeURIComponent(symbol)}`;
+    const yahooUrl = `https://query2.finance.yahoo.com/v7/finance/quote?symbols=${encodeURIComponent(symbol)}`;
     try {
       const resp = await fetch(yahooUrl, {
         headers: {
           'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0 Safari/537.36',
-          'Accept': 'application/json, text/plain, */*'
+          'Accept': 'application/json, text/plain, */*',
+          'Accept-Language': 'en-US,en;q=0.9',
+          'Referer': 'https://finance.yahoo.com/'
         }
       });
       if (!resp.ok) {
