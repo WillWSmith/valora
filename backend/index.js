@@ -94,7 +94,11 @@ function buildCookieHeader(cookies) {
 async function refreshYahooSession() {
   const crumbUrl = 'https://query1.finance.yahoo.com/v1/test/getcrumb';
 
+  console.log('[YahooSession] Refreshing Yahoo Finance session');
   const firstAttempt = await fetch(crumbUrl, { headers: YAHOO_REQUEST_HEADERS });
+  console.log(
+    `[YahooSession] Initial crumb response: ${firstAttempt.status} ${firstAttempt.statusText}`
+  );
   let cookies = extractCookies(firstAttempt.headers);
   let crumbText = firstAttempt.ok ? (await firstAttempt.text()).trim() : '';
 
@@ -104,6 +108,7 @@ async function refreshYahooSession() {
       ? { ...YAHOO_REQUEST_HEADERS, Cookie: cookieHeader }
       : YAHOO_REQUEST_HEADERS;
     const retry = await fetch(crumbUrl, { headers: retryHeaders });
+    console.log(`[YahooSession] Retry crumb response: ${retry.status} ${retry.statusText}`);
     const retryCookies = extractCookies(retry.headers);
     if (retryCookies.length) {
       cookies = retryCookies;
@@ -119,6 +124,11 @@ async function refreshYahooSession() {
   yahooSession.crumb = crumbText;
   yahooSession.cookie = buildCookieHeader(cookies);
   yahooSession.expiresAt = Date.now() + 1000 * 60 * 30; // 30 minutes
+  console.log('[YahooSession] Session refreshed', {
+    hasCookie: Boolean(yahooSession.cookie),
+    crumbLength: yahooSession.crumb?.length || 0,
+    expiresAt: new Date(yahooSession.expiresAt).toISOString()
+  });
   return yahooSession;
 }
 
@@ -141,19 +151,30 @@ async function fetchYahooQuoteViaHttp(symbol, attempt = 0) {
   const session = await getYahooSession(attempt > 0);
   const crumb = session.crumb;
   if (!crumb) {
-    throw new Error('Yahoo Finance crumb is unavailable');
+    console.warn(
+      `[YahooQuote] Crumb unavailable${attempt > 0 ? ' after refresh' : ''}, continuing without crumb parameter`
+    );
   }
-  const url = `https://query1.finance.yahoo.com/v7/finance/quote?symbols=${encodeURIComponent(symbol)}&crumb=${encodeURIComponent(crumb)}`;
+  const crumbParam = crumb ? `&crumb=${encodeURIComponent(crumb)}` : '';
+  const url = `https://query1.finance.yahoo.com/v7/finance/quote?symbols=${encodeURIComponent(symbol)}${crumbParam}`;
   const headers = session.cookie
     ? { ...YAHOO_REQUEST_HEADERS, Cookie: session.cookie }
     : { ...YAHOO_REQUEST_HEADERS };
+  console.log(`[YahooQuote] Fetching ${symbol.toUpperCase()} (attempt ${attempt + 1})`);
   const resp = await fetch(url, { headers });
+  console.log(
+    `[YahooQuote] Response ${resp.status} ${resp.statusText} for ${symbol.toUpperCase()} (attempt ${attempt + 1})`
+  );
   if ((resp.status === 401 || resp.status === 403) && attempt < 2) {
     await refreshYahooSession();
     return fetchYahooQuoteViaHttp(symbol, attempt + 1);
   }
   if (!resp.ok) {
-    throw new Error(`Yahoo Finance responded with status ${resp.status}`);
+    const errorBody = await resp.text();
+    const error = new Error(`Yahoo Finance responded with status ${resp.status}: ${errorBody}`);
+    error.status = resp.status;
+    error.body = errorBody;
+    throw error;
   }
   const json = await resp.json();
   const result = json.quoteResponse?.result?.[0];
@@ -196,9 +217,11 @@ app.get('/api/quote', async (req, res) => {
   const cacheKey = `quote:${symbol.toUpperCase()}`;
   // return cached response if available
   if (cache.has(cacheKey)) {
+    console.log(`[Quote] Cache hit for ${symbol.toUpperCase()}`);
     return res.json(cache.get(cacheKey));
   }
   try {
+    console.log(`[Quote] Fetching data for ${symbol.toUpperCase()}`);
     const quote = await fetchQuoteData(symbol);
     if (!quote) {
       return res.status(404).json({ error: 'Ticker not found' });
@@ -206,9 +229,16 @@ app.get('/api/quote', async (req, res) => {
     const score = computeScore(quote.pe, quote.forwardPE);
     const responseData = { ...quote, score };
     cache.set(cacheKey, responseData);
+    console.log(`[Quote] Returning data for ${symbol.toUpperCase()}`);
     return res.json(responseData);
   } catch (error) {
-    console.error('Error fetching quote', error);
+    console.error(`[Quote] Error fetching data for ${symbol.toUpperCase()}:`, error);
+    if (error?.status === 404) {
+      return res.status(404).json({ error: 'Ticker not found' });
+    }
+    if (error?.status >= 400 && error?.status < 500) {
+      return res.status(400).json({ error: 'Upstream rejected the request', details: error.message });
+    }
     return res.status(502).json({ error: 'Failed to fetch quote' });
   }
 });
