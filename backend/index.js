@@ -14,378 +14,255 @@ app.use((req, res, next) => {
   next();
 });
 
-// simple in-memory LRU cache. max 100 entries, 5 minute TTL
 const cache = new LRU({ max: 100, ttl: 1000 * 60 * 5 });
 
-/**
- * Generic proxy endpoint. Frontend should provide the target URL via the `url` query parameter.
- * The server caches responses to stay within free API limits. If the cached response exists
- * and has not expired, it is returned immediately. Otherwise the server fetches the resource,
- * caches it and forwards it to the client. Note: In production you should validate and
- * whitelist URLs to avoid open proxy risks.
- */
 app.get('/api/proxy', async (req, res) => {
-  const target = req.query.url;
+  const target = (req.query.url || '').toString();
   if (!target) {
     return res.status(400).json({ error: 'Missing url query parameter' });
   }
-  // check cache
+
   if (cache.has(target)) {
     return res.json(cache.get(target));
   }
+
   try {
-    const response = await fetch(target);
+    const response = await fetch(target, { headers: BASE_HEADERS });
     if (!response.ok) {
-      return res.status(response.status).json({ error: `Upstream responded with status ${response.status}` });
+      return res.status(response.status).json({ error: `Upstream responded with ${response.status}` });
     }
+
     const contentType = response.headers.get('content-type') || '';
     if (contentType.includes('application/json')) {
       const data = await response.json();
       cache.set(target, data);
       return res.json(data);
     }
-    // for non-JSON responses, just proxy text
+
     const text = await response.text();
     cache.set(target, text);
     return res.send(text);
-  } catch (err) {
-    console.error(err);
-    return res.status(500).json({ error: 'Failed to fetch resource' });
+  } catch (error) {
+    console.error('[Proxy] Failed to fetch target url', error);
+    res.status(502).json({ error: 'Failed to fetch resource' });
   }
 });
 
-const YAHOO_REQUEST_HEADERS = {
-  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0 Safari/537.36',
-  'Accept': 'application/json, text/plain, */*',
-  'Accept-Language': 'en-US,en;q=0.9'
+const BASE_HEADERS = {
+  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0 Safari/537.36',
+  Accept: 'application/json, text/plain, */*',
+  'Accept-Language': 'en-US,en;q=0.9',
+  Connection: 'keep-alive'
 };
 
-const YAHOO_QUOTE_SUMMARY_HOSTS = ['query2.finance.yahoo.com', 'query1.finance.yahoo.com'];
-const YAHOO_QUOTE_HOSTS = ['query1.finance.yahoo.com', 'query2.finance.yahoo.com'];
+const LANDING_HEADERS = {
+  ...BASE_HEADERS,
+  Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8'
+};
 
-function buildQuoteSummaryUrl(host, symbol) {
-  const encodedSymbol = encodeURIComponent(symbol);
-  return (
-    `https://${host}/v10/finance/quoteSummary/${encodedSymbol}` +
-    '?modules=price%2CsummaryDetail&lang=en-US&region=US&corsDomain=finance.yahoo.com&ssl=true'
-  );
+const YAHOO_HOSTS = ['query1.finance.yahoo.com', 'query2.finance.yahoo.com'];
+
+const session = {
+  cookie: null,
+  crumb: null,
+  expiresAt: 0
+};
+
+function parseCookies(rawCookies = []) {
+  return rawCookies
+    .map((entry) => entry.split(';')[0])
+    .filter(Boolean)
+    .join('; ');
 }
 
-function wait(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+async function refreshSession() {
+  try {
+    console.log('[Yahoo] Refreshing session');
+    const landingResp = await fetch('https://finance.yahoo.com/', {
+      method: 'GET',
+      headers: LANDING_HEADERS
+    });
+
+    if (!landingResp.ok) {
+      console.warn(`[Yahoo] Landing request failed with status ${landingResp.status}`);
+    }
+
+    const landingCookies = landingResp.headers.raw()['set-cookie'] || [];
+    session.cookie = parseCookies(landingCookies) || null;
+    session.expiresAt = Date.now() + 1000 * 60 * 30;
+
+    if (!session.cookie) {
+      console.warn('[Yahoo] No cookies received from landing request');
+      session.crumb = null;
+      return;
+    }
+
+    const crumbResp = await fetch('https://query1.finance.yahoo.com/v1/test/getcrumb', {
+      method: 'GET',
+      headers: {
+        ...BASE_HEADERS,
+        Cookie: session.cookie
+      }
+    });
+
+    if (!crumbResp.ok) {
+      console.warn(`[Yahoo] Crumb request failed with status ${crumbResp.status}`);
+      session.crumb = null;
+      return;
+    }
+
+    const crumbText = (await crumbResp.text()).trim();
+    session.crumb = crumbText || null;
+    console.log(`[Yahoo] Session ready (crumb: ${session.crumb ? 'yes' : 'no'})`);
+  } catch (error) {
+    console.error('[Yahoo] Failed to refresh session', error);
+    session.cookie = null;
+    session.crumb = null;
+    session.expiresAt = Date.now() + 1000 * 60 * 5;
+  }
 }
 
-async function fetchYahooQuoteSummary(symbol, attempt = 0, hostIndex = 0) {
-  const host = YAHOO_QUOTE_SUMMARY_HOSTS[hostIndex] || YAHOO_QUOTE_SUMMARY_HOSTS[0];
-  const url = buildQuoteSummaryUrl(host, symbol);
-  console.log(
-    `[YahooQuote] Fetching summary for ${symbol.toUpperCase()} via ${host} (attempt ${attempt + 1})`
-  );
-
-  let resp;
-  try {
-    resp = await fetch(url, { headers: YAHOO_REQUEST_HEADERS });
-  } catch (err) {
-    console.warn(
-      `[YahooQuote] Network error when calling ${host} for ${symbol.toUpperCase()}:`,
-      err
-    );
-    if (attempt < 2) {
-      return fetchYahooQuoteSummary(symbol, attempt + 1, hostIndex);
-    }
-    if (hostIndex + 1 < YAHOO_QUOTE_SUMMARY_HOSTS.length) {
-      console.warn(
-        `[YahooQuote] Switching host to ${YAHOO_QUOTE_SUMMARY_HOSTS[hostIndex + 1]} after network failure`
-      );
-      return fetchYahooQuoteSummary(symbol, attempt, hostIndex + 1);
-    }
-    err.status = err.status || 503;
-    throw err;
+async function yahooFetch(host, path, { useCrumb = false, retry = true } = {}) {
+  if (!session.cookie || session.expiresAt <= Date.now()) {
+    await refreshSession();
   }
 
-  const bodyText = await resp.text();
-  console.log(
-    `[YahooQuote] Response ${resp.status} ${resp.statusText} for ${symbol.toUpperCase()} (attempt ${attempt + 1})`
-  );
-
-  if (resp.status === 404) {
-    return null;
+  const url = new URL(`https://${host}${path}`);
+  if (useCrumb && session.crumb) {
+    url.searchParams.set('crumb', session.crumb);
   }
 
-  let payload;
-  try {
-    payload = JSON.parse(bodyText);
-  } catch (err) {
-    const parseError = new Error(
-      `Unexpected payload from Yahoo Finance for ${symbol.toUpperCase()}: ${bodyText.slice(0, 200)}`
-    );
-    parseError.status = resp.status;
-    throw parseError;
-  }
-
-  if (resp.status === 429 && attempt < 3) {
-    const backoff = 250 * (attempt + 1);
-    console.warn(
-      `[YahooQuote] Rate limited when calling ${host} for ${symbol.toUpperCase()}; retrying after ${backoff}ms`
-    );
-    await wait(backoff);
-    return fetchYahooQuoteSummary(symbol, attempt + 1, hostIndex);
-  }
-
-  if (resp.status >= 500 || resp.status === 400 || resp.status === 403) {
-    if (hostIndex + 1 < YAHOO_QUOTE_SUMMARY_HOSTS.length) {
-      console.warn(
-        `[YahooQuote] Host ${host} returned ${resp.status}; retrying via ${YAHOO_QUOTE_SUMMARY_HOSTS[hostIndex + 1]}`
-      );
-      return fetchYahooQuoteSummary(symbol, attempt, hostIndex + 1);
-    }
-    if (attempt < 3) {
-      const backoff = 300 * (attempt + 1);
-      console.warn(
-        `[YahooQuote] Host ${host} returned ${resp.status}; retrying after ${backoff}ms`
-      );
-      await wait(backoff);
-      return fetchYahooQuoteSummary(symbol, attempt + 1, hostIndex);
-    }
-  }
-
-  if (!resp.ok) {
-    const error = new Error(`Yahoo Finance responded with status ${resp.status}: ${bodyText}`);
-    error.status = resp.status;
-    error.body = bodyText;
-    throw error;
-  }
-
-  const summary = payload?.quoteSummary;
-  const result = summary?.result?.[0];
-  if (!result) {
-    if (summary?.error?.code === 'Not Found') {
-      return null;
-    }
-    const error = new Error(
-      `Yahoo Finance did not return price data for ${symbol.toUpperCase()}: ${JSON.stringify(summary?.error)}`
-    );
-    error.status = 502;
-    throw error;
-  }
-
-  const priceInfo = result.price || {};
-  const detail = result.summaryDetail || {};
-  const price = priceInfo.regularMarketPrice?.raw ?? priceInfo.regularMarketPrice;
-  const trailingPE = detail.trailingPE?.raw ?? priceInfo.trailingPE?.raw ?? detail.trailingPE;
-  const forwardPE = detail.forwardPE?.raw ?? priceInfo.forwardPE?.raw ?? detail.forwardPE;
-
-  if (typeof price !== 'number') {
-    const error = new Error(
-      `Yahoo Finance response for ${symbol.toUpperCase()} lacked a numeric price: ${JSON.stringify(priceInfo)}`
-    );
-    error.status = 502;
-    throw error;
-  }
-
-  return {
-    symbol: (priceInfo.symbol || symbol || '').toUpperCase(),
-    price,
-    pe: typeof trailingPE === 'number' ? trailingPE : null,
-    forwardPE: typeof forwardPE === 'number' ? forwardPE : null
+  const headers = {
+    ...BASE_HEADERS
   };
+  if (session.cookie) {
+    headers.Cookie = session.cookie;
+  }
+
+  const response = await fetch(url, { headers });
+
+  if ((response.status === 401 || response.status === 403) && retry) {
+    console.warn(`[Yahoo] ${response.status} received, refreshing session and retrying`);
+    session.cookie = null;
+    session.crumb = null;
+    session.expiresAt = 0;
+    await refreshSession();
+    return yahooFetch(host, path, { useCrumb, retry: false });
+  }
+
+  return response;
+}
+
+async function fetchYahooQuote(symbol) {
+  const encodedSymbol = encodeURIComponent(symbol);
+  const path = `/v7/finance/quote?symbols=${encodedSymbol}`;
+  let lastError;
+
+  for (const host of YAHOO_HOSTS) {
+    try {
+      const response = await yahooFetch(host, path, { useCrumb: true });
+
+      if (response.status === 404) {
+        return null;
+      }
+
+      if (!response.ok) {
+        const body = await response.text();
+        lastError = new Error(`Yahoo responded with ${response.status}: ${body}`);
+        lastError.status = response.status;
+        continue;
+      }
+
+      const payload = await response.json();
+      const result = payload?.quoteResponse?.result?.[0];
+
+      if (!result) {
+        return null;
+      }
+
+      const price = result.regularMarketPrice;
+      if (typeof price !== 'number') {
+        throw new Error(`Invalid price data for ${symbol}`);
+      }
+
+      return {
+        symbol: (result.symbol || symbol).toUpperCase(),
+        price,
+        pe: typeof result.trailingPE === 'number' ? result.trailingPE : null,
+        forwardPE: typeof result.forwardPE === 'number' ? result.forwardPE : null
+      };
+    } catch (error) {
+      lastError = error;
+      console.warn(`[Yahoo] Error from host ${host} for ${symbol}:`, error);
+    }
+  }
+
+  if (lastError) {
+    lastError.status = lastError.status || 502;
+    throw lastError;
+  }
+
+  const fallbackError = new Error('Yahoo Finance did not return data');
+  fallbackError.status = 502;
+  throw fallbackError;
 }
 
 function computeScore(pe, forwardPE) {
-  let score = 50;
-  if (typeof pe === 'number' && typeof forwardPE === 'number') {
-    const invPE = 1 / Math.max(pe, 0.0001);
-    const invForwardPE = 1 / Math.max(forwardPE, 0.0001);
-    score = Math.min(100, Math.max(0, (invPE + invForwardPE) * 10));
+  if (typeof pe !== 'number' && typeof forwardPE !== 'number') {
+    return 50;
   }
-  return score;
+
+  const values = [];
+  if (typeof pe === 'number' && pe > 0) {
+    values.push(1 / pe);
+  }
+  if (typeof forwardPE === 'number' && forwardPE > 0) {
+    values.push(1 / forwardPE);
+  }
+
+  if (values.length === 0) {
+    return 50;
+  }
+
+  const average = values.reduce((sum, value) => sum + value, 0) / values.length;
+  return Math.max(0, Math.min(100, Math.round(average * 100)));
 }
 
-async function fetchYahooQuote(symbol, attempt = 0, hostIndex = 0) {
-  const host = YAHOO_QUOTE_HOSTS[hostIndex] || YAHOO_QUOTE_HOSTS[0];
-  const encodedSymbol = encodeURIComponent(symbol);
-  const url = `https://${host}/v7/finance/quote?symbols=${encodedSymbol}&lang=en-US&region=US&corsDomain=finance.yahoo.com`;
-  console.log(
-    `[YahooQuote] Fetching realtime quote for ${symbol.toUpperCase()} via ${host} (attempt ${attempt + 1})`
-  );
-
-  let resp;
-  try {
-    resp = await fetch(url, { headers: YAHOO_REQUEST_HEADERS });
-  } catch (err) {
-    console.warn(`[YahooQuote] Network error from ${host} for ${symbol.toUpperCase()}:`, err);
-    if (attempt < 2) {
-      return fetchYahooQuote(symbol, attempt + 1, hostIndex);
-    }
-    if (hostIndex + 1 < YAHOO_QUOTE_HOSTS.length) {
-      console.warn(
-        `[YahooQuote] Switching quote host to ${YAHOO_QUOTE_HOSTS[hostIndex + 1]} after network failure`
-      );
-      return fetchYahooQuote(symbol, attempt, hostIndex + 1);
-    }
-    err.status = err.status || 503;
-    throw err;
-  }
-
-  const bodyText = await resp.text();
-  console.log(
-    `[YahooQuote] Quote host response ${resp.status} ${resp.statusText} for ${symbol.toUpperCase()} (attempt ${
-      attempt + 1
-    })`
-  );
-
-  if (resp.status === 404) {
-    return null;
-  }
-
-  if (resp.status === 429 && attempt < 3) {
-    const backoff = 250 * (attempt + 1);
-    console.warn(
-      `[YahooQuote] Rate limited on quote host ${host} for ${symbol.toUpperCase()}; retrying after ${backoff}ms`
-    );
-    await wait(backoff);
-    return fetchYahooQuote(symbol, attempt + 1, hostIndex);
-  }
-
-  if (resp.status >= 500 || resp.status === 400 || resp.status === 403) {
-    if (hostIndex + 1 < YAHOO_QUOTE_HOSTS.length) {
-      console.warn(
-        `[YahooQuote] Quote host ${host} returned ${resp.status}; retrying via ${YAHOO_QUOTE_HOSTS[hostIndex + 1]}`
-      );
-      return fetchYahooQuote(symbol, attempt, hostIndex + 1);
-    }
-    if (attempt < 3) {
-      const backoff = 300 * (attempt + 1);
-      console.warn(
-        `[YahooQuote] Quote host ${host} returned ${resp.status}; retrying after ${backoff}ms`
-      );
-      await wait(backoff);
-      return fetchYahooQuote(symbol, attempt + 1, hostIndex);
-    }
-  }
-
-  if (!resp.ok) {
-    const error = new Error(`Yahoo Finance quote endpoint responded with status ${resp.status}: ${bodyText}`);
-    error.status = resp.status;
-    error.body = bodyText;
-    throw error;
-  }
-
-  let payload;
-  try {
-    payload = JSON.parse(bodyText);
-  } catch (err) {
-    const parseError = new Error(
-      `Unexpected payload from Yahoo quote endpoint for ${symbol.toUpperCase()}: ${bodyText.slice(0, 200)}`
-    );
-    parseError.status = resp.status;
-    throw parseError;
-  }
-
-  const result = payload?.quoteResponse?.result?.[0];
-  if (!result) {
-    if (payload?.quoteResponse?.error) {
-      const error = new Error(
-        `Yahoo quote endpoint reported an error for ${symbol.toUpperCase()}: ${JSON.stringify(
-          payload.quoteResponse.error
-        )}`
-      );
-      error.status = 502;
-      throw error;
-    }
-    return null;
-  }
-
-  const price = result.regularMarketPrice;
-  const trailingPE = result.trailingPE ?? result.peRatio;
-  const forwardPE = result.forwardPE;
-
-  if (typeof price !== 'number') {
-    const error = new Error(
-      `Yahoo quote endpoint response for ${symbol.toUpperCase()} lacked a numeric price: ${JSON.stringify(result)}`
-    );
-    error.status = 502;
-    throw error;
-  }
-
-  return {
-    symbol: (result.symbol || symbol || '').toUpperCase(),
-    price,
-    pe: typeof trailingPE === 'number' ? trailingPE : null,
-    forwardPE: typeof forwardPE === 'number' ? forwardPE : null
-  };
-}
-
-async function fetchQuoteData(symbol) {
-  const upperSymbol = symbol.toUpperCase();
-  try {
-    const summaryQuote = await fetchYahooQuoteSummary(upperSymbol);
-    if (summaryQuote) {
-      return summaryQuote;
-    }
-  } catch (err) {
-    console.warn(
-      `[Quote] quoteSummary lookup failed for ${upperSymbol}; attempting realtime quote endpoint instead:`,
-      err
-    );
-    if (err?.status === 404) {
-      throw err;
-    }
-  }
-
-  const realtimeQuote = await fetchYahooQuote(upperSymbol);
-  if (!realtimeQuote) {
-    const error = new Error(`Yahoo Finance did not return data for ${upperSymbol}`);
-    error.status = 404;
-    throw error;
-  }
-  return realtimeQuote;
-}
-
-/**
- * Quote endpoint.
- * Fetches basic quote data for a given ticker symbol from Yahoo Finance and computes a rudimentary Smart Score.
- * The score is currently a simple composite based on P/E and forward P/E; lower values result in higher scores.
- * In the future this logic should be replaced by the more comprehensive scoring algorithm described in docs/research.md.
- */
 app.get('/api/quote', async (req, res) => {
-  const symbol = req.query.symbol;
+  const symbol = (req.query.symbol || '').toString().trim();
   if (!symbol) {
     return res.status(400).json({ error: 'Missing symbol query parameter' });
   }
+
   const cacheKey = `quote:${symbol.toUpperCase()}`;
-  // return cached response if available
   if (cache.has(cacheKey)) {
     console.log(`[Quote] Cache hit for ${symbol.toUpperCase()}`);
     return res.json(cache.get(cacheKey));
   }
+
   try {
-    console.log(`[Quote] Fetching data for ${symbol.toUpperCase()}`);
-    const quote = await fetchQuoteData(symbol);
+    const quote = await fetchYahooQuote(symbol);
+
     if (!quote) {
       return res.status(404).json({ error: 'Ticker not found' });
     }
+
     const score = computeScore(quote.pe, quote.forwardPE);
-    const responseData = { ...quote, score };
-    cache.set(cacheKey, responseData);
-    console.log(`[Quote] Returning data for ${symbol.toUpperCase()}`);
-    return res.json(responseData);
+    const payload = { ...quote, score };
+    cache.set(cacheKey, payload);
+    res.json(payload);
   } catch (error) {
-    console.error(`[Quote] Error fetching data for ${symbol.toUpperCase()}:`, error);
+    console.error(`[Quote] Failed to fetch data for ${symbol}:`, error);
     if (error?.status === 404) {
       return res.status(404).json({ error: 'Ticker not found' });
     }
     if (error?.status >= 400 && error?.status < 500) {
-      return res.status(400).json({ error: 'Upstream rejected the request', details: error.message });
+      return res.status(400).json({ error: 'Upstream rejected the request' });
     }
-    return res.status(502).json({
-      error: 'Failed to fetch quote',
-      details: error?.message || 'Unknown error when contacting Yahoo Finance'
-    });
+    res.status(502).json({ error: 'Failed to fetch quote' });
   }
 });
 
-// healthcheck endpoint
 app.get('/api/health', (req, res) => {
   res.json({ status: 'ok' });
 });
