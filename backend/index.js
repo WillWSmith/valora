@@ -50,6 +50,134 @@ app.get('/api/proxy', async (req, res) => {
   }
 });
 
+const YAHOO_REQUEST_HEADERS = {
+  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0 Safari/537.36',
+  'Accept': 'application/json, text/plain, */*',
+  'Accept-Language': 'en-US,en;q=0.9',
+  Referer: 'https://finance.yahoo.com/',
+  Origin: 'https://finance.yahoo.com'
+};
+
+const yahooSession = {
+  crumb: null,
+  cookie: null,
+  expiresAt: 0
+};
+
+function extractCookies(headers) {
+  const raw = headers.raw()?.['set-cookie'] || [];
+  return raw.map((cookie) => cookie.split(';')[0]).filter(Boolean);
+}
+
+function buildCookieHeader(cookies) {
+  return cookies.length ? cookies.join('; ') : null;
+}
+
+async function refreshYahooSession() {
+  const crumbUrl = 'https://query1.finance.yahoo.com/v1/test/getcrumb';
+
+  const firstAttempt = await fetch(crumbUrl, { headers: YAHOO_REQUEST_HEADERS });
+  let cookies = extractCookies(firstAttempt.headers);
+  let crumbText = firstAttempt.ok ? (await firstAttempt.text()).trim() : '';
+
+  if (!crumbText) {
+    const cookieHeader = buildCookieHeader(cookies);
+    const retryHeaders = cookieHeader
+      ? { ...YAHOO_REQUEST_HEADERS, Cookie: cookieHeader }
+      : YAHOO_REQUEST_HEADERS;
+    const retry = await fetch(crumbUrl, { headers: retryHeaders });
+    const retryCookies = extractCookies(retry.headers);
+    if (retryCookies.length) {
+      cookies = retryCookies;
+    }
+    if (retry.ok) {
+      crumbText = (await retry.text()).trim();
+    }
+    if (!crumbText) {
+      throw new Error(`Failed to retrieve Yahoo Finance crumb (status: ${retry.status})`);
+    }
+  }
+
+  yahooSession.crumb = crumbText;
+  yahooSession.cookie = buildCookieHeader(cookies);
+  yahooSession.expiresAt = Date.now() + 1000 * 60 * 30; // 30 minutes
+  return yahooSession;
+}
+
+async function getYahooSession(forceRefresh = false) {
+  if (!forceRefresh && yahooSession.crumb && yahooSession.expiresAt > Date.now()) {
+    return yahooSession;
+  }
+  try {
+    return await refreshYahooSession();
+  } catch (err) {
+    if (!forceRefresh && yahooSession.crumb) {
+      // return existing session even if refresh fails so we can attempt the request
+      return yahooSession;
+    }
+    throw err;
+  }
+}
+
+async function fetchYahooQuoteViaHttp(symbol, attempt = 0) {
+  const session = await getYahooSession(attempt > 0);
+  const crumb = session.crumb;
+  if (!crumb) {
+    throw new Error('Yahoo Finance crumb is unavailable');
+  }
+  const url = `https://query1.finance.yahoo.com/v7/finance/quote?symbols=${encodeURIComponent(symbol)}&crumb=${encodeURIComponent(crumb)}`;
+  const headers = session.cookie
+    ? { ...YAHOO_REQUEST_HEADERS, Cookie: session.cookie }
+    : { ...YAHOO_REQUEST_HEADERS };
+  const resp = await fetch(url, { headers });
+  if (resp.status === 401 && attempt === 0) {
+    await refreshYahooSession();
+    return fetchYahooQuoteViaHttp(symbol, attempt + 1);
+  }
+  if (!resp.ok) {
+    throw new Error(`Yahoo Finance responded with status ${resp.status}`);
+  }
+  const json = await resp.json();
+  const result = json.quoteResponse?.result?.[0];
+  if (!result) {
+    return null;
+  }
+  return {
+    symbol: result.symbol,
+    price: result.regularMarketPrice,
+    pe: result.trailingPE,
+    forwardPE: result.forwardPE
+  };
+}
+
+function computeScore(pe, forwardPE) {
+  let score = 50;
+  if (typeof pe === 'number' && typeof forwardPE === 'number') {
+    const invPE = 1 / Math.max(pe, 0.0001);
+    const invForwardPE = 1 / Math.max(forwardPE, 0.0001);
+    score = Math.min(100, Math.max(0, (invPE + invForwardPE) * 10));
+  }
+  return score;
+}
+
+async function fetchQuoteData(symbol) {
+  try {
+    const quote = await yahooFinance.quote(symbol.toUpperCase());
+    if (!quote) {
+      return null;
+    }
+    return {
+      symbol: quote.symbol,
+      price: quote.regularMarketPrice,
+      pe: quote.trailingPE,
+      forwardPE: quote.forwardPE
+    };
+  } catch (err) {
+    console.error('yahoo-finance2 library failed, falling back to manual fetch', err);
+    return await fetchYahooQuoteViaHttp(symbol.toUpperCase());
+  }
+}
+
 /**
  * Quote endpoint.
  * Fetches basic quote data for a given ticker symbol from Yahoo Finance and computes a rudimentary Smart Score.
@@ -67,67 +195,17 @@ app.get('/api/quote', async (req, res) => {
     return res.json(cache.get(cacheKey));
   }
   try {
-    // use yahoo-finance2 library to fetch quote; this library handles crumb and query parameters internally
-    const quote = await yahooFinance.quote(symbol.toUpperCase());
+    const quote = await fetchQuoteData(symbol);
     if (!quote) {
       return res.status(404).json({ error: 'Ticker not found' });
     }
-    const price = quote.regularMarketPrice;
-    const pe = quote.trailingPE;
-    const forwardPE = quote.forwardPE;
-    // basic scoring: invert P/E values; if undefined, default to 0
-    let score = 50;
-    if (typeof pe === 'number' && typeof forwardPE === 'number') {
-      const invPE = 1 / Math.max(pe, 0.0001);
-      const invForwardPE = 1 / Math.max(forwardPE, 0.0001);
-      score = Math.min(100, Math.max(0, (invPE + invForwardPE) * 10));
-    }
-    const responseData = {
-      symbol: quote.symbol,
-      price,
-      pe,
-      forwardPE,
-      score
-    };
+    const score = computeScore(quote.pe, quote.forwardPE);
+    const responseData = { ...quote, score };
     cache.set(cacheKey, responseData);
     return res.json(responseData);
   } catch (error) {
     console.error('Error fetching quote', error);
-    // if library fails due to network or API changes, fallback to old fetch logic
-    const yahooUrl = `https://query2.finance.yahoo.com/v7/finance/quote?symbols=${encodeURIComponent(symbol)}`;
-    try {
-      const resp = await fetch(yahooUrl, {
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0 Safari/537.36',
-          'Accept': 'application/json, text/plain, */*',
-          'Accept-Language': 'en-US,en;q=0.9',
-          'Referer': 'https://finance.yahoo.com/'
-        }
-      });
-      if (!resp.ok) {
-        return res.status(resp.status).json({ error: `Yahoo Finance responded with status ${resp.status}` });
-      }
-      const json = await resp.json();
-      const result = json.quoteResponse && json.quoteResponse.result && json.quoteResponse.result[0];
-      if (!result) {
-        return res.status(404).json({ error: 'Ticker not found' });
-      }
-      const price = result.regularMarketPrice;
-      const pe = result.trailingPE;
-      const forwardPE = result.forwardPE;
-      let score = 50;
-      if (typeof pe === 'number' && typeof forwardPE === 'number') {
-        const invPE = 1 / Math.max(pe, 0.0001);
-        const invForwardPE = 1 / Math.max(forwardPE, 0.0001);
-        score = Math.min(100, Math.max(0, (invPE + invForwardPE) * 10));
-      }
-      const responseData = { symbol: result.symbol, price, pe, forwardPE, score };
-      cache.set(cacheKey, responseData);
-      return res.json(responseData);
-    } catch (fallbackErr) {
-      console.error('Fallback quote fetch failed', fallbackErr);
-      return res.status(500).json({ error: 'Failed to fetch quote' });
-    }
+    return res.status(502).json({ error: 'Failed to fetch quote' });
   }
 });
 
