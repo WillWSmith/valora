@@ -57,9 +57,7 @@ app.get('/api/proxy', async (req, res) => {
 const YAHOO_REQUEST_HEADERS = {
   'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0 Safari/537.36',
   'Accept': 'application/json, text/plain, */*',
-  'Accept-Language': 'en-US,en;q=0.9',
-  Referer: 'https://finance.yahoo.com/',
-  Origin: 'https://finance.yahoo.com'
+  'Accept-Language': 'en-US,en;q=0.9'
 };
 
 const YAHOO_QUOTE_SUMMARY_HOSTS = ['query2.finance.yahoo.com', 'query1.finance.yahoo.com'];
@@ -67,7 +65,10 @@ const YAHOO_QUOTE_HOSTS = ['query1.finance.yahoo.com', 'query2.finance.yahoo.com
 
 function buildQuoteSummaryUrl(host, symbol) {
   const encodedSymbol = encodeURIComponent(symbol);
-  return `https://${host}/v10/finance/quoteSummary/${encodedSymbol}?modules=price%2CsummaryDetail`;
+  return (
+    `https://${host}/v10/finance/quoteSummary/${encodedSymbol}` +
+    '?modules=price%2CsummaryDetail&lang=en-US&region=US&corsDomain=finance.yahoo.com&ssl=true'
+  );
 }
 
 function wait(ms) {
@@ -131,7 +132,7 @@ async function fetchYahooQuoteSummary(symbol, attempt = 0, hostIndex = 0) {
     return fetchYahooQuoteSummary(symbol, attempt + 1, hostIndex);
   }
 
-  if (resp.status >= 500) {
+  if (resp.status >= 500 || resp.status === 400 || resp.status === 403) {
     if (hostIndex + 1 < YAHOO_QUOTE_SUMMARY_HOSTS.length) {
       console.warn(
         `[YahooQuote] Host ${host} returned ${resp.status}; retrying via ${YAHOO_QUOTE_SUMMARY_HOSTS[hostIndex + 1]}`
@@ -203,7 +204,7 @@ function computeScore(pe, forwardPE) {
 async function fetchYahooQuote(symbol, attempt = 0, hostIndex = 0) {
   const host = YAHOO_QUOTE_HOSTS[hostIndex] || YAHOO_QUOTE_HOSTS[0];
   const encodedSymbol = encodeURIComponent(symbol);
-  const url = `https://${host}/v7/finance/quote?symbols=${encodedSymbol}`;
+  const url = `https://${host}/v7/finance/quote?symbols=${encodedSymbol}&lang=en-US&region=US&corsDomain=finance.yahoo.com`;
   console.log(
     `[YahooQuote] Fetching realtime quote for ${symbol.toUpperCase()} via ${host} (attempt ${attempt + 1})`
   );
@@ -246,7 +247,7 @@ async function fetchYahooQuote(symbol, attempt = 0, hostIndex = 0) {
     return fetchYahooQuote(symbol, attempt + 1, hostIndex);
   }
 
-  if (resp.status >= 500) {
+  if (resp.status >= 500 || resp.status === 400 || resp.status === 403) {
     if (hostIndex + 1 < YAHOO_QUOTE_HOSTS.length) {
       console.warn(
         `[YahooQuote] Quote host ${host} returned ${resp.status}; retrying via ${YAHOO_QUOTE_HOSTS[hostIndex + 1]}`
