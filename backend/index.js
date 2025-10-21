@@ -1,6 +1,5 @@
 import express from 'express';
 import fetch from 'node-fetch';
-import yahooFinance from 'yahoo-finance2';
 import LRU from 'lru-cache';
 import cors from 'cors';
 import dotenv from 'dotenv';
@@ -180,21 +179,7 @@ function computeScore(pe, forwardPE) {
 }
 
 async function fetchQuoteData(symbol) {
-  try {
-    const quote = await yahooFinance.quote(symbol.toUpperCase());
-    if (!quote) {
-      return null;
-    }
-    return {
-      symbol: quote.symbol,
-      price: quote.regularMarketPrice,
-      pe: quote.trailingPE,
-      forwardPE: quote.forwardPE
-    };
-  } catch (err) {
-    console.error('yahoo-finance2 library failed, falling back to manual fetch', err);
-    return await fetchYahooQuoteViaHttp(symbol.toUpperCase());
-  }
+  return await fetchYahooQuoteViaHttp(symbol.toUpperCase());
 }
 
 /**
