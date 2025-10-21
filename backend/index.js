@@ -57,176 +57,129 @@ const YAHOO_REQUEST_HEADERS = {
   Origin: 'https://finance.yahoo.com'
 };
 
-const yahooSession = {
-  crumb: null,
-  cookie: null,
-  expiresAt: 0
-};
+const YAHOO_QUOTE_SUMMARY_HOSTS = ['query2.finance.yahoo.com', 'query1.finance.yahoo.com'];
 
-const YAHOO_BOOTSTRAP_URL = 'https://fc.yahoo.com';
-const YAHOO_CRUMB_URL = 'https://query1.finance.yahoo.com/v1/test/getcrumb';
-const YAHOO_QUOTE_HOSTS = ['query1.finance.yahoo.com', 'query2.finance.yahoo.com'];
-
-function extractCookies(headers) {
-  if (!headers) {
-    return [];
-  }
-  if (typeof headers.getSetCookie === 'function') {
-    return headers
-      .getSetCookie()
-      .map((cookie) => cookie.split(';')[0])
-      .filter(Boolean);
-  }
-  if (typeof headers.raw === 'function') {
-    const raw = headers.raw()?.['set-cookie'] || [];
-    return raw.map((cookie) => cookie.split(';')[0]).filter(Boolean);
-  }
-  const header = headers.get?.('set-cookie');
-  if (header) {
-    return header
-      .split(/,(?=[^,]+=)/)
-      .map((cookie) => cookie.split(';')[0])
-      .filter(Boolean);
-  }
-  return [];
+function buildQuoteSummaryUrl(host, symbol) {
+  const encodedSymbol = encodeURIComponent(symbol);
+  return `https://${host}/v10/finance/quoteSummary/${encodedSymbol}?modules=price%2CsummaryDetail`;
 }
 
-function buildCookieHeader(cookies) {
-  return cookies.length ? cookies.join('; ') : null;
+function wait(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function refreshYahooSession() {
-  console.log('[YahooSession] Refreshing Yahoo Finance session');
-  let collectedCookies = [];
-  let crumbText = '';
+async function fetchYahooQuoteSummary(symbol, attempt = 0, hostIndex = 0) {
+  const host = YAHOO_QUOTE_SUMMARY_HOSTS[hostIndex] || YAHOO_QUOTE_SUMMARY_HOSTS[0];
+  const url = buildQuoteSummaryUrl(host, symbol);
+  console.log(
+    `[YahooQuote] Fetching summary for ${symbol.toUpperCase()} via ${host} (attempt ${attempt + 1})`
+  );
 
-  try {
-    const bootstrap = await fetch(YAHOO_BOOTSTRAP_URL, { headers: YAHOO_REQUEST_HEADERS });
-    console.log(
-      `[YahooSession] Bootstrap response: ${bootstrap.status} ${bootstrap.statusText}`
-    );
-    const bootstrapCookies = extractCookies(bootstrap.headers);
-    if (bootstrapCookies.length) {
-      collectedCookies = bootstrapCookies;
-    }
-  } catch (err) {
-    console.warn('[YahooSession] Failed to load bootstrap cookies', err);
-  }
-
-  try {
-    const cookieHeader = buildCookieHeader(collectedCookies);
-    const crumbHeaders = cookieHeader
-      ? { ...YAHOO_REQUEST_HEADERS, Cookie: cookieHeader }
-      : { ...YAHOO_REQUEST_HEADERS };
-    const crumbResp = await fetch(YAHOO_CRUMB_URL, { headers: crumbHeaders });
-    console.log(
-      `[YahooSession] Crumb response: ${crumbResp.status} ${crumbResp.statusText}`
-    );
-    const crumbCookies = extractCookies(crumbResp.headers);
-    if (crumbCookies.length) {
-      collectedCookies = crumbCookies;
-    }
-    if (crumbResp.ok) {
-      crumbText = (await crumbResp.text()).trim();
-    }
-    if (!crumbText) {
-      console.warn('[YahooSession] Crumb endpoint returned no crumb; proceeding without it');
-    }
-  } catch (err) {
-    console.warn('[YahooSession] Failed to refresh crumb; continuing with cookies only', err);
-  }
-
-  yahooSession.crumb = crumbText || null;
-  yahooSession.cookie = buildCookieHeader(collectedCookies);
-  yahooSession.expiresAt = Date.now() + 1000 * 60 * 30; // 30 minutes
-  console.log('[YahooSession] Session refreshed', {
-    hasCookie: Boolean(yahooSession.cookie),
-    crumbLength: yahooSession.crumb?.length || 0,
-    expiresAt: new Date(yahooSession.expiresAt).toISOString()
-  });
-  return yahooSession;
-}
-
-async function getYahooSession(forceRefresh = false) {
-  if (!forceRefresh && yahooSession.crumb && yahooSession.expiresAt > Date.now()) {
-    return yahooSession;
-  }
-  try {
-    return await refreshYahooSession();
-  } catch (err) {
-    if (!forceRefresh && yahooSession.crumb) {
-      // return existing session even if refresh fails so we can attempt the request
-      return yahooSession;
-    }
-    throw err;
-  }
-}
-
-async function fetchYahooQuoteViaHttp(symbol, attempt = 0, hostIndex = 0) {
-  const session = await getYahooSession(attempt > 0);
-  const crumb = session.crumb;
-  if (!crumb) {
-    console.warn(
-      `[YahooQuote] Crumb unavailable${attempt > 0 ? ' after refresh' : ''}, continuing without crumb parameter`
-    );
-  }
-  const crumbParam = crumb ? `&crumb=${encodeURIComponent(crumb)}` : '';
-  const host = YAHOO_QUOTE_HOSTS[hostIndex] || YAHOO_QUOTE_HOSTS[0];
-  const url = `https://${host}/v7/finance/quote?symbols=${encodeURIComponent(symbol)}${crumbParam}`;
-  const headers = session.cookie
-    ? { ...YAHOO_REQUEST_HEADERS, Cookie: session.cookie }
-    : { ...YAHOO_REQUEST_HEADERS };
-  console.log(`[YahooQuote] Fetching ${symbol.toUpperCase()} (attempt ${attempt + 1})`);
   let resp;
   try {
-    resp = await fetch(url, { headers });
+    resp = await fetch(url, { headers: YAHOO_REQUEST_HEADERS });
   } catch (err) {
     console.warn(
       `[YahooQuote] Network error when calling ${host} for ${symbol.toUpperCase()}:`,
       err
     );
     if (attempt < 2) {
-      await refreshYahooSession();
-      return fetchYahooQuoteViaHttp(symbol, attempt + 1, hostIndex);
+      return fetchYahooQuoteSummary(symbol, attempt + 1, hostIndex);
     }
-    if (hostIndex + 1 < YAHOO_QUOTE_HOSTS.length) {
+    if (hostIndex + 1 < YAHOO_QUOTE_SUMMARY_HOSTS.length) {
       console.warn(
-        `[YahooQuote] Switching host to ${YAHOO_QUOTE_HOSTS[hostIndex + 1]} after network failure`
+        `[YahooQuote] Switching host to ${YAHOO_QUOTE_SUMMARY_HOSTS[hostIndex + 1]} after network failure`
       );
-      return fetchYahooQuoteViaHttp(symbol, attempt, hostIndex + 1);
+      return fetchYahooQuoteSummary(symbol, attempt, hostIndex + 1);
     }
     throw err;
   }
+
+  const bodyText = await resp.text();
   console.log(
     `[YahooQuote] Response ${resp.status} ${resp.statusText} for ${symbol.toUpperCase()} (attempt ${attempt + 1})`
   );
-  if ((resp.status === 401 || resp.status === 403) && attempt < 2) {
-    await refreshYahooSession();
-    return fetchYahooQuoteViaHttp(symbol, attempt + 1, hostIndex);
-  }
-  if (resp.status >= 500 && hostIndex + 1 < YAHOO_QUOTE_HOSTS.length) {
-    console.warn(
-      `[YahooQuote] Host ${host} returned ${resp.status}; retrying via ${YAHOO_QUOTE_HOSTS[hostIndex + 1]}`
-    );
-    return fetchYahooQuoteViaHttp(symbol, attempt, hostIndex + 1);
-  }
-  if (!resp.ok) {
-    const errorBody = await resp.text();
-    const error = new Error(`Yahoo Finance responded with status ${resp.status}: ${errorBody}`);
-    error.status = resp.status;
-    error.body = errorBody;
-    throw error;
-  }
-  const json = await resp.json();
-  const result = json.quoteResponse?.result?.[0];
-  if (!result) {
+
+  if (resp.status === 404) {
     return null;
   }
+
+  let payload;
+  try {
+    payload = JSON.parse(bodyText);
+  } catch (err) {
+    const parseError = new Error(
+      `Unexpected payload from Yahoo Finance for ${symbol.toUpperCase()}: ${bodyText.slice(0, 200)}`
+    );
+    parseError.status = resp.status;
+    throw parseError;
+  }
+
+  if (resp.status === 429 && attempt < 3) {
+    const backoff = 250 * (attempt + 1);
+    console.warn(
+      `[YahooQuote] Rate limited when calling ${host} for ${symbol.toUpperCase()}; retrying after ${backoff}ms`
+    );
+    await wait(backoff);
+    return fetchYahooQuoteSummary(symbol, attempt + 1, hostIndex);
+  }
+
+  if (resp.status >= 500) {
+    if (hostIndex + 1 < YAHOO_QUOTE_SUMMARY_HOSTS.length) {
+      console.warn(
+        `[YahooQuote] Host ${host} returned ${resp.status}; retrying via ${YAHOO_QUOTE_SUMMARY_HOSTS[hostIndex + 1]}`
+      );
+      return fetchYahooQuoteSummary(symbol, attempt, hostIndex + 1);
+    }
+    if (attempt < 3) {
+      const backoff = 300 * (attempt + 1);
+      console.warn(
+        `[YahooQuote] Host ${host} returned ${resp.status}; retrying after ${backoff}ms`
+      );
+      await wait(backoff);
+      return fetchYahooQuoteSummary(symbol, attempt + 1, hostIndex);
+    }
+  }
+
+  if (!resp.ok) {
+    const error = new Error(`Yahoo Finance responded with status ${resp.status}: ${bodyText}`);
+    error.status = resp.status;
+    error.body = bodyText;
+    throw error;
+  }
+
+  const summary = payload?.quoteSummary;
+  const result = summary?.result?.[0];
+  if (!result) {
+    if (summary?.error?.code === 'Not Found') {
+      return null;
+    }
+    const error = new Error(
+      `Yahoo Finance did not return price data for ${symbol.toUpperCase()}: ${JSON.stringify(summary?.error)}`
+    );
+    error.status = 502;
+    throw error;
+  }
+
+  const priceInfo = result.price || {};
+  const detail = result.summaryDetail || {};
+  const price = priceInfo.regularMarketPrice?.raw ?? priceInfo.regularMarketPrice;
+  const trailingPE = detail.trailingPE?.raw ?? priceInfo.trailingPE?.raw ?? detail.trailingPE;
+  const forwardPE = detail.forwardPE?.raw ?? priceInfo.forwardPE?.raw ?? detail.forwardPE;
+
+  if (typeof price !== 'number') {
+    const error = new Error(
+      `Yahoo Finance response for ${symbol.toUpperCase()} lacked a numeric price: ${JSON.stringify(priceInfo)}`
+    );
+    error.status = 502;
+    throw error;
+  }
+
   return {
-    symbol: result.symbol,
-    price: result.regularMarketPrice,
-    pe: result.trailingPE,
-    forwardPE: result.forwardPE
+    symbol: (priceInfo.symbol || symbol || '').toUpperCase(),
+    price,
+    pe: typeof trailingPE === 'number' ? trailingPE : null,
+    forwardPE: typeof forwardPE === 'number' ? forwardPE : null
   };
 }
 
@@ -241,7 +194,7 @@ function computeScore(pe, forwardPE) {
 }
 
 async function fetchQuoteData(symbol) {
-  return await fetchYahooQuoteViaHttp(symbol.toUpperCase());
+  return await fetchYahooQuoteSummary(symbol.toUpperCase());
 }
 
 /**
