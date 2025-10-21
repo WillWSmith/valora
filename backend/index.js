@@ -63,6 +63,10 @@ const yahooSession = {
   expiresAt: 0
 };
 
+const YAHOO_BOOTSTRAP_URL = 'https://fc.yahoo.com';
+const YAHOO_CRUMB_URL = 'https://query1.finance.yahoo.com/v1/test/getcrumb';
+const YAHOO_QUOTE_HOSTS = ['query1.finance.yahoo.com', 'query2.finance.yahoo.com'];
+
 function extractCookies(headers) {
   if (!headers) {
     return [];
@@ -92,44 +96,48 @@ function buildCookieHeader(cookies) {
 }
 
 async function refreshYahooSession() {
-  const crumbUrl = 'https://query1.finance.yahoo.com/v1/test/getcrumb';
-
   console.log('[YahooSession] Refreshing Yahoo Finance session');
+  let collectedCookies = [];
   let crumbText = '';
-  let cookies = [];
 
   try {
-    const firstAttempt = await fetch(crumbUrl, { headers: YAHOO_REQUEST_HEADERS });
+    const bootstrap = await fetch(YAHOO_BOOTSTRAP_URL, { headers: YAHOO_REQUEST_HEADERS });
     console.log(
-      `[YahooSession] Initial crumb response: ${firstAttempt.status} ${firstAttempt.statusText}`
+      `[YahooSession] Bootstrap response: ${bootstrap.status} ${bootstrap.statusText}`
     );
-    cookies = extractCookies(firstAttempt.headers);
-    crumbText = firstAttempt.ok ? (await firstAttempt.text()).trim() : '';
-
-    if (!crumbText) {
-      const cookieHeader = buildCookieHeader(cookies);
-      const retryHeaders = cookieHeader
-        ? { ...YAHOO_REQUEST_HEADERS, Cookie: cookieHeader }
-        : YAHOO_REQUEST_HEADERS;
-      const retry = await fetch(crumbUrl, { headers: retryHeaders });
-      console.log(`[YahooSession] Retry crumb response: ${retry.status} ${retry.statusText}`);
-      const retryCookies = extractCookies(retry.headers);
-      if (retryCookies.length) {
-        cookies = retryCookies;
-      }
-      if (retry.ok) {
-        crumbText = (await retry.text()).trim();
-      }
-      if (!crumbText) {
-        console.warn('[YahooSession] Crumb endpoint responded without a crumb value');
-      }
+    const bootstrapCookies = extractCookies(bootstrap.headers);
+    if (bootstrapCookies.length) {
+      collectedCookies = bootstrapCookies;
     }
   } catch (err) {
-    console.warn('[YahooSession] Failed to refresh crumb, continuing without it', err);
+    console.warn('[YahooSession] Failed to load bootstrap cookies', err);
+  }
+
+  try {
+    const cookieHeader = buildCookieHeader(collectedCookies);
+    const crumbHeaders = cookieHeader
+      ? { ...YAHOO_REQUEST_HEADERS, Cookie: cookieHeader }
+      : { ...YAHOO_REQUEST_HEADERS };
+    const crumbResp = await fetch(YAHOO_CRUMB_URL, { headers: crumbHeaders });
+    console.log(
+      `[YahooSession] Crumb response: ${crumbResp.status} ${crumbResp.statusText}`
+    );
+    const crumbCookies = extractCookies(crumbResp.headers);
+    if (crumbCookies.length) {
+      collectedCookies = crumbCookies;
+    }
+    if (crumbResp.ok) {
+      crumbText = (await crumbResp.text()).trim();
+    }
+    if (!crumbText) {
+      console.warn('[YahooSession] Crumb endpoint returned no crumb; proceeding without it');
+    }
+  } catch (err) {
+    console.warn('[YahooSession] Failed to refresh crumb; continuing with cookies only', err);
   }
 
   yahooSession.crumb = crumbText || null;
-  yahooSession.cookie = buildCookieHeader(cookies);
+  yahooSession.cookie = buildCookieHeader(collectedCookies);
   yahooSession.expiresAt = Date.now() + 1000 * 60 * 30; // 30 minutes
   console.log('[YahooSession] Session refreshed', {
     hasCookie: Boolean(yahooSession.cookie),
@@ -154,7 +162,7 @@ async function getYahooSession(forceRefresh = false) {
   }
 }
 
-async function fetchYahooQuoteViaHttp(symbol, attempt = 0) {
+async function fetchYahooQuoteViaHttp(symbol, attempt = 0, hostIndex = 0) {
   const session = await getYahooSession(attempt > 0);
   const crumb = session.crumb;
   if (!crumb) {
@@ -163,18 +171,44 @@ async function fetchYahooQuoteViaHttp(symbol, attempt = 0) {
     );
   }
   const crumbParam = crumb ? `&crumb=${encodeURIComponent(crumb)}` : '';
-  const url = `https://query1.finance.yahoo.com/v7/finance/quote?symbols=${encodeURIComponent(symbol)}${crumbParam}`;
+  const host = YAHOO_QUOTE_HOSTS[hostIndex] || YAHOO_QUOTE_HOSTS[0];
+  const url = `https://${host}/v7/finance/quote?symbols=${encodeURIComponent(symbol)}${crumbParam}`;
   const headers = session.cookie
     ? { ...YAHOO_REQUEST_HEADERS, Cookie: session.cookie }
     : { ...YAHOO_REQUEST_HEADERS };
   console.log(`[YahooQuote] Fetching ${symbol.toUpperCase()} (attempt ${attempt + 1})`);
-  const resp = await fetch(url, { headers });
+  let resp;
+  try {
+    resp = await fetch(url, { headers });
+  } catch (err) {
+    console.warn(
+      `[YahooQuote] Network error when calling ${host} for ${symbol.toUpperCase()}:`,
+      err
+    );
+    if (attempt < 2) {
+      await refreshYahooSession();
+      return fetchYahooQuoteViaHttp(symbol, attempt + 1, hostIndex);
+    }
+    if (hostIndex + 1 < YAHOO_QUOTE_HOSTS.length) {
+      console.warn(
+        `[YahooQuote] Switching host to ${YAHOO_QUOTE_HOSTS[hostIndex + 1]} after network failure`
+      );
+      return fetchYahooQuoteViaHttp(symbol, attempt, hostIndex + 1);
+    }
+    throw err;
+  }
   console.log(
     `[YahooQuote] Response ${resp.status} ${resp.statusText} for ${symbol.toUpperCase()} (attempt ${attempt + 1})`
   );
   if ((resp.status === 401 || resp.status === 403) && attempt < 2) {
     await refreshYahooSession();
-    return fetchYahooQuoteViaHttp(symbol, attempt + 1);
+    return fetchYahooQuoteViaHttp(symbol, attempt + 1, hostIndex);
+  }
+  if (resp.status >= 500 && hostIndex + 1 < YAHOO_QUOTE_HOSTS.length) {
+    console.warn(
+      `[YahooQuote] Host ${host} returned ${resp.status}; retrying via ${YAHOO_QUOTE_HOSTS[hostIndex + 1]}`
+    );
+    return fetchYahooQuoteViaHttp(symbol, attempt, hostIndex + 1);
   }
   if (!resp.ok) {
     const errorBody = await resp.text();
@@ -246,7 +280,10 @@ app.get('/api/quote', async (req, res) => {
     if (error?.status >= 400 && error?.status < 500) {
       return res.status(400).json({ error: 'Upstream rejected the request', details: error.message });
     }
-    return res.status(502).json({ error: 'Failed to fetch quote' });
+    return res.status(502).json({
+      error: 'Failed to fetch quote',
+      details: error?.message || 'Unknown error when contacting Yahoo Finance'
+    });
   }
 });
 
