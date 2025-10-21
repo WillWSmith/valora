@@ -149,7 +149,7 @@ async function fetchYahooQuoteViaHttp(symbol, attempt = 0) {
     ? { ...YAHOO_REQUEST_HEADERS, Cookie: session.cookie }
     : { ...YAHOO_REQUEST_HEADERS };
   const resp = await fetch(url, { headers });
-  if (resp.status === 401 && attempt === 0) {
+  if ((resp.status === 401 || resp.status === 403) && attempt < 2) {
     await refreshYahooSession();
     return fetchYahooQuoteViaHttp(symbol, attempt + 1);
   }
